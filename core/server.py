@@ -1,3 +1,6 @@
+# --- Request-Scoped OAuth Injection Context ---
+# This part is essential for the decorator-based injection to work.
+import contextvars
 import logging
 import os
 from importlib import metadata
@@ -21,11 +24,31 @@ from auth.oauth_responses import (
 # Import shared configuration
 from auth.scopes import OAUTH_STATE_TO_SESSION_ID_MAP, SCOPES
 from fastapi import Header
-from fastapi import Request as FastAPIRequest
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from mcp.server.fastmcp import FastMCP
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
+
+# Context variable to hold injected credentials for the life of a single request.
+_injected_oauth_credentials = contextvars.ContextVar(
+    "injected_oauth_credentials", default=None
+)
+
+
+def get_injected_oauth_credentials():
+    """
+    Retrieve injected OAuth credentials for the current request context.
+    This is called by the authentication layer to check for request-scoped credentials.
+    """
+    return _injected_oauth_credentials.get()
+
+
+def set_injected_oauth_credentials(credentials: Optional[dict]):
+    """
+    Set or clear the injected OAuth credentials for the current request context.
+    This is called by the service decorator.
+    """
+    _injected_oauth_credentials.set(credentials)
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -44,94 +67,6 @@ server = FastMCP(
     port=WORKSPACE_MCP_PORT,
     host="0.0.0.0",
 )
-
-# --- OAuth Injection Middleware (Request-Scoped) ---
-
-# Simple in-memory store for injected credentials (request-scoped)
-import contextvars
-
-_injected_oauth_credentials = contextvars.ContextVar(
-    "injected_oauth_credentials", default=None
-)
-
-
-def get_injected_oauth_credentials():
-    """Retrieve injected OAuth credentials for the current request context, if any."""
-    return _injected_oauth_credentials.get()
-
-
-def clear_injected_oauth_credentials():
-    """Clear injected OAuth credentials from the current request context."""
-    _injected_oauth_credentials.set(None)
-
-
-class OAuthInjectionMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        # Extract OAuth credentials from headers
-        auth_header = request.headers.get("authorization")
-        user_email = request.headers.get("x-user-email")
-        user_id = request.headers.get("x-user-id")
-        # Only inject if Authorization header is present
-        if auth_header and auth_header.lower().startswith("bearer "):
-            token = auth_header[7:].strip()
-            creds = {
-                "access_token": token,
-                "user_email": user_email,
-                "user_id": user_id,
-            }
-            _injected_oauth_credentials.set(creds)
-            logger.debug(f"Injected OAuth credentials for {user_email or user_id}")
-        else:
-            clear_injected_oauth_credentials()
-        try:
-            response = await call_next(request)
-        finally:
-            clear_injected_oauth_credentials()
-        return response
-
-
-# Register the middleware
-server.app.add_middleware(OAuthInjectionMiddleware)
-
-# --- OAuth Injection Management Endpoints ---
-
-
-@server.custom_route("/oauth/status", methods=["GET"])
-async def oauth_status(request: FastAPIRequest):
-    """Return the status of injected OAuth credentials for the current request."""
-    creds = get_injected_oauth_credentials()
-    if creds:
-        return JSONResponse(
-            {
-                "injected": True,
-                "user_email": creds.get("user_email"),
-                "user_id": creds.get("user_id"),
-            }
-        )
-    return JSONResponse({"injected": False})
-
-
-@server.custom_route("/oauth/inject", methods=["POST"])
-async def oauth_inject(request: FastAPIRequest):
-    """Inject OAuth credentials for the current request context via API."""
-    data = await request.json()
-    token = data.get("access_token")
-    user_email = data.get("user_email")
-    user_id = data.get("user_id")
-    if not token:
-        return JSONResponse({"error": "access_token required"}, status_code=400)
-    creds = {"access_token": token, "user_email": user_email, "user_id": user_id}
-    _injected_oauth_credentials.set(creds)
-    return JSONResponse(
-        {"injected": True, "user_email": user_email, "user_id": user_id}
-    )
-
-
-@server.custom_route("/oauth/clear", methods=["POST"])
-async def oauth_clear(request: FastAPIRequest):
-    """Clear any injected OAuth credentials for the current request context."""
-    clear_injected_oauth_credentials()
-    return JSONResponse({"cleared": True})
 
 
 def set_transport_mode(mode: str):
