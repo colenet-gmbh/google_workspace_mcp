@@ -325,6 +325,28 @@ async def your_new_tool(service, param1: str, param2: int = 10):
 - **Network Exposure**: Consider authentication when using `mcpo` over networks
 - **Scope Minimization**: Tools request only necessary permissions
 
+## 🔐 Advanced OAuth Injection & Environment Variables
+
+The Google Workspace MCP server supports advanced, request-scoped OAuth credential injection and flexible client credential configuration for secure, multi-user, and cloud-native deployments.
+
+### Request-Scoped OAuth Injection
+- **Header-Based:**
+  - Provide an `Authorization: Bearer <token>` header (optionally with `X-User-Email` and `X-User-Id`) on any request.
+  - The token is used for all Google API calls during that request only.
+- **API Endpoints:**
+  - `GET /oauth/status`: Check if credentials are injected for the current request.
+  - `POST /oauth/inject`: Inject credentials for the current request context (JSON body: `access_token`, optional `user_email`, `user_id`).
+  - `POST /oauth/clear`: Clear any injected credentials for the current request context.
+- **Security:** Credentials are only available for the duration of the request and are never persisted to disk or shared between requests.
+
+### Environment Variable-Based Client Credentials
+- You can now provide your Google OAuth client credentials using the environment variables:
+  - `GOOGLE_OAUTH_CLIENT_ID`
+  - `GOOGLE_OAUTH_CLIENT_SECRET`
+  - (optional) `GOOGLE_OAUTH_REDIRECT_URI`
+- If these variables are set, they will be used in preference to any `client_secret.json` file.
+- This makes containerized and cloud deployments easier, more secure, and eliminates the need for file-based secrets management.
+
 ---
 
 ## 🌐 Integration with Open WebUI

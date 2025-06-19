@@ -1,56 +1,31 @@
 import logging
 import os
-from typing import Optional
 from importlib import metadata
+from typing import Optional
 
-from fastapi import Header
-from fastapi.responses import HTMLResponse
-
-from mcp import types
-
-from mcp.server.fastmcp import FastMCP
-from starlette.requests import Request
-
-from auth.google_auth import handle_auth_callback, start_auth_flow, CONFIG_CLIENT_SECRETS_PATH
-from auth.oauth_callback_server import get_oauth_redirect_uri, ensure_oauth_callback_available
-from auth.oauth_responses import create_error_response, create_success_response, create_server_error_response
+from auth.google_auth import (
+    CONFIG_CLIENT_SECRETS_PATH,
+    handle_auth_callback,
+    start_auth_flow,
+)
+from auth.oauth_callback_server import (
+    ensure_oauth_callback_available,
+    get_oauth_redirect_uri,
+)
+from auth.oauth_responses import (
+    create_error_response,
+    create_server_error_response,
+    create_success_response,
+)
 
 # Import shared configuration
-from auth.scopes import (
-    OAUTH_STATE_TO_SESSION_ID_MAP,
-    USERINFO_EMAIL_SCOPE,
-    OPENID_SCOPE,
-    CALENDAR_READONLY_SCOPE,
-    CALENDAR_EVENTS_SCOPE,
-    DRIVE_READONLY_SCOPE,
-    DRIVE_FILE_SCOPE,
-    GMAIL_READONLY_SCOPE,
-    GMAIL_SEND_SCOPE,
-    GMAIL_COMPOSE_SCOPE,
-    GMAIL_MODIFY_SCOPE,
-    GMAIL_LABELS_SCOPE,
-    BASE_SCOPES,
-    CALENDAR_SCOPES,
-    DRIVE_SCOPES,
-    GMAIL_SCOPES,
-    DOCS_READONLY_SCOPE,
-    DOCS_WRITE_SCOPE,
-    CHAT_READONLY_SCOPE,
-    CHAT_WRITE_SCOPE,
-    CHAT_SPACES_SCOPE,
-    CHAT_SCOPES,
-    SHEETS_READONLY_SCOPE,
-    SHEETS_WRITE_SCOPE,
-    SHEETS_SCOPES,
-    FORMS_BODY_SCOPE,
-    FORMS_BODY_READONLY_SCOPE,
-    FORMS_RESPONSES_READONLY_SCOPE,
-    FORMS_SCOPES,
-    SLIDES_SCOPE,
-    SLIDES_READONLY_SCOPE,
-    SLIDES_SCOPES,
-    SCOPES
-)
+from auth.scopes import OAUTH_STATE_TO_SESSION_ID_MAP, SCOPES
+from fastapi import Header
+from fastapi import Request as FastAPIRequest
+from fastapi.responses import HTMLResponse, JSONResponse
+from mcp.server.fastmcp import FastMCP
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -67,8 +42,97 @@ server = FastMCP(
     name="google_workspace",
     server_url=f"{WORKSPACE_MCP_BASE_URI}:{WORKSPACE_MCP_PORT}/mcp",
     port=WORKSPACE_MCP_PORT,
-    host="0.0.0.0"
+    host="0.0.0.0",
 )
+
+# --- OAuth Injection Middleware (Request-Scoped) ---
+
+# Simple in-memory store for injected credentials (request-scoped)
+import contextvars
+
+_injected_oauth_credentials = contextvars.ContextVar(
+    "injected_oauth_credentials", default=None
+)
+
+
+def get_injected_oauth_credentials():
+    """Retrieve injected OAuth credentials for the current request context, if any."""
+    return _injected_oauth_credentials.get()
+
+
+def clear_injected_oauth_credentials():
+    """Clear injected OAuth credentials from the current request context."""
+    _injected_oauth_credentials.set(None)
+
+
+class OAuthInjectionMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        # Extract OAuth credentials from headers
+        auth_header = request.headers.get("authorization")
+        user_email = request.headers.get("x-user-email")
+        user_id = request.headers.get("x-user-id")
+        # Only inject if Authorization header is present
+        if auth_header and auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+            creds = {
+                "access_token": token,
+                "user_email": user_email,
+                "user_id": user_id,
+            }
+            _injected_oauth_credentials.set(creds)
+            logger.debug(f"Injected OAuth credentials for {user_email or user_id}")
+        else:
+            clear_injected_oauth_credentials()
+        try:
+            response = await call_next(request)
+        finally:
+            clear_injected_oauth_credentials()
+        return response
+
+
+# Register the middleware
+server.app.add_middleware(OAuthInjectionMiddleware)
+
+# --- OAuth Injection Management Endpoints ---
+
+
+@server.custom_route("/oauth/status", methods=["GET"])
+async def oauth_status(request: FastAPIRequest):
+    """Return the status of injected OAuth credentials for the current request."""
+    creds = get_injected_oauth_credentials()
+    if creds:
+        return JSONResponse(
+            {
+                "injected": True,
+                "user_email": creds.get("user_email"),
+                "user_id": creds.get("user_id"),
+            }
+        )
+    return JSONResponse({"injected": False})
+
+
+@server.custom_route("/oauth/inject", methods=["POST"])
+async def oauth_inject(request: FastAPIRequest):
+    """Inject OAuth credentials for the current request context via API."""
+    data = await request.json()
+    token = data.get("access_token")
+    user_email = data.get("user_email")
+    user_id = data.get("user_id")
+    if not token:
+        return JSONResponse({"error": "access_token required"}, status_code=400)
+    creds = {"access_token": token, "user_email": user_email, "user_id": user_id}
+    _injected_oauth_credentials.set(creds)
+    return JSONResponse(
+        {"injected": True, "user_email": user_email, "user_id": user_id}
+    )
+
+
+@server.custom_route("/oauth/clear", methods=["POST"])
+async def oauth_clear(request: FastAPIRequest):
+    """Clear any injected OAuth credentials for the current request context."""
+    clear_injected_oauth_credentials()
+    return JSONResponse({"cleared": True})
+
 
 def set_transport_mode(mode: str):
     """Set the current transport mode for OAuth callback handling."""
@@ -76,25 +140,32 @@ def set_transport_mode(mode: str):
     _current_transport_mode = mode
     logger.info(f"Transport mode set to: {mode}")
 
+
 def get_oauth_redirect_uri_for_current_mode() -> str:
     """Get OAuth redirect URI based on current transport mode."""
-    return get_oauth_redirect_uri(_current_transport_mode, WORKSPACE_MCP_PORT, WORKSPACE_MCP_BASE_URI)
+    return get_oauth_redirect_uri(
+        _current_transport_mode, WORKSPACE_MCP_PORT, WORKSPACE_MCP_BASE_URI
+    )
+
 
 # Health check endpoint
 @server.custom_route("/health", methods=["GET"])
 async def health_check(request: Request):
     """Health check endpoint for container orchestration."""
     from fastapi.responses import JSONResponse
+
     try:
         version = metadata.version("workspace-mcp")
     except metadata.PackageNotFoundError:
         version = "dev"
-    return JSONResponse({
-        "status": "healthy",
-        "service": "workspace-mcp",
-        "version": version,
-        "transport": _current_transport_mode
-    })
+    return JSONResponse(
+        {
+            "status": "healthy",
+            "service": "workspace-mcp",
+            "version": version,
+            "transport": _current_transport_mode,
+        }
+    )
 
 
 @server.custom_route("/oauth2callback", methods=["GET"])
@@ -109,57 +180,79 @@ async def oauth2_callback(request: Request) -> HTMLResponse:
     error = request.query_params.get("error")
 
     if error:
-        error_message = f"Authentication failed: Google returned an error: {error}. State: {state}."
+        error_message = (
+            f"Authentication failed: Google returned an error: {error}. State: {state}."
+        )
         logger.error(error_message)
         return create_error_response(error_message)
 
     if not code:
-        error_message = "Authentication failed: No authorization code received from Google."
+        error_message = (
+            "Authentication failed: No authorization code received from Google."
+        )
         logger.error(error_message)
         return create_error_response(error_message)
 
     try:
         client_secrets_path = CONFIG_CLIENT_SECRETS_PATH
         if not os.path.exists(client_secrets_path):
-            logger.error(f"OAuth client secrets file not found at {client_secrets_path}")
+            logger.error(
+                f"OAuth client secrets file not found at {client_secrets_path}"
+            )
             # This is a server configuration error, should not happen in a deployed environment.
-            return HTMLResponse(content="Server Configuration Error: Client secrets not found.", status_code=500)
+            return HTMLResponse(
+                content="Server Configuration Error: Client secrets not found.",
+                status_code=500,
+            )
 
-        logger.info(f"OAuth callback: Received code (state: {state}). Attempting to exchange for tokens.")
+        logger.info(
+            f"OAuth callback: Received code (state: {state}). Attempting to exchange for tokens."
+        )
 
         mcp_session_id: Optional[str] = OAUTH_STATE_TO_SESSION_ID_MAP.pop(state, None)
         if mcp_session_id:
-            logger.info(f"OAuth callback: Retrieved MCP session ID '{mcp_session_id}' for state '{state}'.")
+            logger.info(
+                f"OAuth callback: Retrieved MCP session ID '{mcp_session_id}' for state '{state}'."
+            )
         else:
-            logger.warning(f"OAuth callback: No MCP session ID found for state '{state}'. Auth will not be tied to a specific session directly via this callback.")
+            logger.warning(
+                f"OAuth callback: No MCP session ID found for state '{state}'. Auth will not be tied to a specific session directly via this callback."
+            )
 
         # Exchange code for credentials. handle_auth_callback will save them.
         # The user_id returned here is the Google-verified email.
         verified_user_id, credentials = handle_auth_callback(
             client_secrets_path=client_secrets_path,
-            scopes=SCOPES, # Ensure all necessary scopes are requested
+            scopes=SCOPES,  # Ensure all necessary scopes are requested
             authorization_response=str(request.url),
             redirect_uri=get_oauth_redirect_uri_for_current_mode(),
-            session_id=mcp_session_id # Pass session_id if available
+            session_id=mcp_session_id,  # Pass session_id if available
         )
 
-        log_session_part = f" (linked to session: {mcp_session_id})" if mcp_session_id else ""
-        logger.info(f"OAuth callback: Successfully authenticated user: {verified_user_id} (state: {state}){log_session_part}.")
+        log_session_part = (
+            f" (linked to session: {mcp_session_id})" if mcp_session_id else ""
+        )
+        logger.info(
+            f"OAuth callback: Successfully authenticated user: {verified_user_id} (state: {state}){log_session_part}."
+        )
 
         # Return success page using shared template
         return create_success_response(verified_user_id)
 
     except Exception as e:
-        error_message_detail = f"Error processing OAuth callback (state: {state}): {str(e)}"
+        error_message_detail = (
+            f"Error processing OAuth callback (state: {state}): {str(e)}"
+        )
         logger.error(error_message_detail, exc_info=True)
         # Generic error page for any other issues during token exchange or credential saving
         return create_server_error_response(str(e))
+
 
 @server.tool()
 async def start_google_auth(
     user_google_email: str,
     service_name: str,
-    mcp_session_id: Optional[str] = Header(None, alias="Mcp-Session-Id")
+    mcp_session_id: Optional[str] = Header(None, alias="Mcp-Session-Id"),
 ) -> str:
     """
     Initiates the Google OAuth 2.0 authentication flow for the specified user email and service.
@@ -186,7 +279,11 @@ async def start_google_auth(
     Returns:
         str: A detailed message for the LLM with the authorization URL and instructions to guide the user through the authentication process.
     """
-    if not user_google_email or not isinstance(user_google_email, str) or '@' not in user_google_email:
+    if (
+        not user_google_email
+        or not isinstance(user_google_email, str)
+        or "@" not in user_google_email
+    ):
         error_msg = "Invalid or missing 'user_google_email'. This parameter is required and must be a valid email address. LLM, please ask the user for their Google email address."
         logger.error(f"[start_google_auth] {error_msg}")
         raise Exception(error_msg)
@@ -196,17 +293,21 @@ async def start_google_auth(
         logger.error(f"[start_google_auth] {error_msg}")
         raise Exception(error_msg)
 
-    logger.info(f"Tool 'start_google_auth' invoked for user_google_email: '{user_google_email}', service: '{service_name}', session: '{mcp_session_id}'.")
+    logger.info(
+        f"Tool 'start_google_auth' invoked for user_google_email: '{user_google_email}', service: '{service_name}', session: '{mcp_session_id}'."
+    )
 
     # Ensure OAuth callback is available for current transport mode
     redirect_uri = get_oauth_redirect_uri_for_current_mode()
-    if not ensure_oauth_callback_available(_current_transport_mode, WORKSPACE_MCP_PORT, WORKSPACE_MCP_BASE_URI):
+    if not ensure_oauth_callback_available(
+        _current_transport_mode, WORKSPACE_MCP_PORT, WORKSPACE_MCP_BASE_URI
+    ):
         raise Exception("Failed to start OAuth callback server. Please try again.")
 
     auth_result = await start_auth_flow(
         mcp_session_id=mcp_session_id,
         user_google_email=user_google_email,
         service_name=service_name,
-        redirect_uri=redirect_uri
+        redirect_uri=redirect_uri,
     )
     return auth_result
